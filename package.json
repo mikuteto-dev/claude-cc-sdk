@@ -1,6 +1,6 @@
 {
   "name": "claude-cc-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Unofficial SDK that talks to the Claude API through Claude Code's subscription auth",
   "type": "module",
   "main": "dist/index.js",
@@ -36,7 +36,7 @@
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mikumiku-jp/claude-cc-sdk.git"
+    "url": "git+https://github.com/mikuteto-dev/claude-cc-sdk.git"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.112.1"

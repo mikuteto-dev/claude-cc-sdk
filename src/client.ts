@@ -41,7 +41,7 @@ export interface Send {
 }
 
 // Keep these values aligned with the installed Claude Code binary.
-const VER = "2.1.261";
+const VER = "2.1.278";
 const B = {
   cc: "claude-code-20250219",     oauth: "oauth-2025-04-20",
   isp: "interleaved-thinking-2025-05-14", redact: "redact-thinking-2026-02-12",
@@ -51,6 +51,34 @@ const B = {
   extTtl: "extended-cache-ttl-2025-04-11",
   fast: "fast-mode-2026-02-01",   ctx1m: "context-1m-2025-08-07",
 } as const;
+
+// Model capability gates, mirroring CC's bundled catalog. Unknown names fall
+// through to the permissive branch, same as CC's first-party defaults.
+const NON_ADAPTIVE = ["claude-3-", "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5",
+  "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-haiku-4-5"];
+const MIDCONV = ["claude-sonnet-5", "claude-opus-4-8", "claude-opus-5", "claude-fable-5",
+  "claude-mythos-5-1"];
+const EFFORT = ["claude-sonnet-4-6", "claude-sonnet-5", "claude-opus-4-6", "claude-opus-4-7",
+  "claude-opus-4-8", "claude-opus-5", "claude-fable-5", "claude-mythos-5-1"];
+const OUT64K = ["claude-sonnet-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
+  "claude-opus-5", "claude-fable-5", "claude-mythos-5"];
+const OUT32K = ["claude-haiku-4-5", "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6",
+  "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5", "claude-3-7-sonnet"];
+
+const has = (m: string, list: string[]) => list.some(p => m.includes(p));
+const adaptiveCapable = (m: string) => !has(m, NON_ADAPTIVE);
+const thinkCapable = (m: string) => !m.includes("claude-3-");
+const midConv = (m: string) => has(m, MIDCONV);
+const effortCapable = (m: string) => has(m, EFFORT);
+const effortDefault = (m: string) => m.includes("claude-opus-4-7") ? "xhigh" : "high";
+
+function maxOut(m: string): number {
+  if (has(m, OUT64K)) return 64000;
+  if (has(m, OUT32K)) return 32000;
+  if (m.includes("claude-3-opus") || m.includes("claude-3-haiku")) return 4096;
+  if (m.includes("claude-3-")) return 8192;
+  return 64000;
+}
 
 interface CcConfig {
   userID?: string;
@@ -81,32 +109,17 @@ function envHeaders(): Record<string, string> {
   return h;
 }
 
-// CC adds a one-hour ephemeral cache breakpoint to system + last user content.
-const EPHEMERAL = { type: "ephemeral" as const, ttl: "1h" as const };
+// CC puts an ephemeral cache breakpoint on its own system blocks (never on
+// user message content). Subscribed OAuth accounts get the 1h TTL allowlist;
+// API-key requests get the default 5m TTL.
+const ephemeral = (ttl: string) => ({ type: "ephemeral" as const, ttl: ttl as "1h" | "5m" });
 
-function cacheSystem(sys: any) {
+function cacheSystem(sys: any, ttl: string) {
   if (!sys) return undefined;
-  if (typeof sys === "string") return [{ type: "text", text: sys, cache_control: EPHEMERAL }];
+  if (typeof sys === "string") return [{ type: "text", text: sys, cache_control: ephemeral(ttl) }];
   const a = [...sys];
-  if (a.length) a[a.length - 1] = { ...a[a.length - 1], cache_control: EPHEMERAL };
+  if (a.length) a[a.length - 1] = { ...a[a.length - 1], cache_control: ephemeral(ttl) };
   return a;
-}
-
-function cacheLastUser(msgs: Msg[]): Msg[] {
-  const out = [...msgs];
-  for (let i = out.length - 1; i >= 0; i--) {
-    if (out[i].role !== "user") continue;
-    const m = out[i];
-    if (typeof m.content === "string") {
-      out[i] = { role: "user", content: [{ type: "text", text: m.content, cache_control: EPHEMERAL }] } as any;
-    } else if (Array.isArray(m.content) && m.content.length) {
-      const c = [...m.content];
-      c[c.length - 1] = { ...c[c.length - 1], cache_control: EPHEMERAL } as any;
-      out[i] = { role: "user", content: c };
-    }
-    break;
-  }
-  return out;
 }
 
 function contentText(content: unknown): string {
@@ -141,12 +154,32 @@ function systemBlocks(sys: string | Anthropic.Messages.TextBlockParam[]): any[] 
   return typeof sys === "string" ? [{ type: "text", text: sys }] : [...sys];
 }
 
-function resolveThinking(t: Send["thinking"], interactive: boolean): { on: boolean; param: any } {
+function resolveThinking(t: Send["thinking"], interactive: boolean, model: string, maxTokens: number): { on: boolean; param: any } {
   if (!t) return { on: false, param: undefined };
   if (t === true || t === "adaptive") {
-    return { on: true, param: { type: "adaptive", ...(interactive ? {} : { display: "omitted" }) } };
+    const display = interactive ? {} : { display: "omitted" as const };
+    if (adaptiveCapable(model)) return { on: true, param: { type: "adaptive", ...display } };
+    // CC falls back to budget thinking on models without adaptive_thinking
+    return { on: true, param: { type: "enabled", budget_tokens: Math.max(1024, maxTokens - 1), ...display } };
   }
   return { on: true, param: t };
+}
+
+// CLAUDE_CODE_EXTRA_BODY merges arbitrary fields into the request body.
+function extraBody(): Record<string, unknown> {
+  const raw = process.env.CLAUDE_CODE_EXTRA_BODY;
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  } catch { /* malformed env is ignored by CC too */ }
+  return {};
+}
+
+// CLAUDE_CODE_ATTRIBUTION_HEADER=<falsy> suppresses the billing system block.
+function attributionOn(): boolean {
+  const v = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER;
+  return v === undefined || /^(1|true|yes|on)$/i.test(v.trim());
 }
 
 let generatedDeviceId: string | undefined;
@@ -183,16 +216,28 @@ export class Claude {
     return { user_id: JSON.stringify({ device_id: this.did, account_uuid: this.ccCfg.oauthAccount?.accountUuid ?? "", session_id: this.sid }) };
   }
 
-  private betas(o: Send, think: boolean) {
+  private entrypoint() {
+    return process.env.CLAUDE_CODE_ENTRYPOINT ?? (this.interactive ? "cli" : "sdk-cli");
+  }
+
+  private ttl() { return this.auth.oauth ? "1h" : "5m"; }
+
+  // Betas are model-capability driven in CC, not driven by the request's
+  // thinking flag: thinking-capable models always carry isp/ttc (and redact on
+  // the interactive entrypoint).
+  private betas(o: Send, model: string) {
     const b: string[] = [B.cc];
     if (this.auth.oauth) b.push(B.oauth);
-    if (think) {
+    if (thinkCapable(model)) {
       b.push(B.isp);
-      // Interactive CC sends this beta by default; sdk-cli only does so when requested.
       if (o.redact ?? this.interactive) b.push(B.redact);
-      b.push(B.ttc);
+      b.push(B.ttc, B.ctx);
     }
-    b.push(B.ctx, B.cache, B.midSys, B.advisor, B.effort, B.extTtl);
+    b.push(B.cache);
+    if (midConv(model)) b.push(B.midSys);
+    b.push(B.advisor);
+    if (effortCapable(model)) b.push(B.effort);
+    if (this.ttl() === "1h") b.push(B.extTtl);
     if (o.ctx1m) b.push(B.ctx1m);
     if (o.speed === "fast") b.push(B.fast);
     for (const x of [...this.xbetas, ...(o.betas ?? [])]) if (!b.includes(x)) b.push(x);
@@ -200,51 +245,65 @@ export class Claude {
   }
 
   private params(o: Send, stream = false) {
-    const { on: think, param: thinkParam } = resolveThinking(o.thinking, this.interactive);
+    const model = o.model ?? this.model;
+    const maxTokens = o.maxTokens ?? maxOut(model);
+    const { on: think, param: thinkParam } = resolveThinking(o.thinking, this.interactive, model, maxTokens);
     const useCache = o.cache !== false;
     const oc: Record<string, unknown> = {};
-    if (o.effort) oc.effort = o.effort;
+    // CC sends the model's default effort; unsupported values are dropped.
+    if (effortCapable(model)) oc.effort = o.effort ?? effortDefault(model);
+
+    const extra = extraBody();
+    let betas = this.betas(o, model);
+    const xb = extra.anthropic_beta ?? extra.betas;
+    if (xb !== undefined) {
+      const list = (Array.isArray(xb) ? xb : String(xb).split(",")).map(v => String(v).trim()).filter(Boolean);
+      betas = [...list, ...betas.filter(v => !list.includes(v))];
+      delete extra.anthropic_beta;
+      delete extra.betas;
+    }
 
     return {
-      model: o.model ?? this.model,
-      messages: useCache ? cacheLastUser(o.messages) : o.messages,
-      max_tokens: o.maxTokens ?? (think ? 64000 : 16000),
+      model,
+      messages: o.messages,
+      max_tokens: maxTokens,
       metadata: this.meta(),
-      betas: this.betas(o, think),
+      betas,
       stream,
       ...(this.auth.oauth ? { system: this.firstPartySystem(o, useCache) } :
-        o.system !== undefined ? { system: useCache ? cacheSystem(o.system) : o.system } : {}),
+        o.system !== undefined ? { system: useCache ? cacheSystem(o.system, this.ttl()) : o.system } : {}),
       ...(o.tools && { tools: o.tools }),
       ...(o.toolChoice && { tool_choice: o.toolChoice }),
       ...(o.stop && { stop_sequences: o.stop }),
-      // API rejects temperature != 1 when thinking is on
-      ...(!think && { temperature: o.temperature ?? 1 }),
+      // CC only sends temperature when explicitly set, and never with thinking
+      ...(!think && o.temperature !== undefined && { temperature: o.temperature }),
       ...(think && { thinking: thinkParam }),
       ...(think && { context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] } }),
       ...(Object.keys(oc).length && { output_config: oc }),
       ...(o.speed && { speed: o.speed }),
+      ...extra,
     };
   }
 
   private firstPartySystem(o: Send, useCache: boolean): any[] {
-    const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? (this.interactive ? "cli" : "sdk-cli");
+    const ttl = this.ttl();
     const blocks: any[] = [
-      {
+      attributionOn() && {
         type: "text",
-        text: `x-anthropic-billing-header: cc_version=${VER}.${billingSuffix(o.messages)}; cc_entrypoint=${entrypoint};`,
+        text: `x-anthropic-billing-header: cc_version=${VER}.${billingSuffix(o.messages)}; cc_entrypoint=${this.entrypoint()};`,
       },
       {
         type: "text",
         text: this.interactive
           ? "You are Claude Code, Anthropic's official CLI for Claude."
           : "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-        ...(useCache ? { cache_control: EPHEMERAL } : {}),
+        ...(useCache ? { cache_control: ephemeral(ttl) } : {}),
       },
-    ];
+    ].filter(Boolean);
     if (o.system !== undefined) {
       const supplied = systemBlocks(o.system);
       if (useCache && supplied.length) {
-        supplied[supplied.length - 1] = { ...supplied[supplied.length - 1], cache_control: EPHEMERAL };
+        supplied[supplied.length - 1] = { ...supplied[supplied.length - 1], cache_control: ephemeral(ttl) };
       }
       blocks.push(...supplied);
     }
@@ -256,9 +315,10 @@ export class Claude {
     await this.auth.refresh();
     const h: Record<string, string> = {
       "x-app": "cli",
-      "User-Agent": `claude-cli/${VER} (external, ${this.interactive ? "cli" : "sdk-cli"})`,
+      "User-Agent": `claude-cli/${VER} (external, ${this.entrypoint()})`,
       "X-Claude-Code-Session-Id": this.sid,
-      ...(this.auth.oauth ? { "anthropic-dangerous-direct-browser-access": "true" } : {}),
+      // CC constructs the SDK client with dangerouslyAllowBrowser: true
+      "anthropic-dangerous-direct-browser-access": "true",
       ...envHeaders(),
     };
     const c: ConstructorParameters<typeof Anthropic>[0] = {
