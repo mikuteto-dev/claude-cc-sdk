@@ -184,6 +184,7 @@ Auth priority:
 | `speed` | `"fast"` | Fast mode |
 | `ctx1m` | `boolean` | 1M context window |
 | `redact` | `boolean` | Send the thinking-redaction beta (default: `true` in interactive mode) |
+| `lowPriority` | `boolean \| "v2s" \| "v2d" \| "v2p"` | Lower-priority mode: stamps the `anthropic-dispatch-id` header |
 | `cache` | `boolean` | Prompt caching (default: `true`) |
 | `signal` | `AbortSignal` | Cancellation |
 | `timeout` | `number` | Timeout in ms |

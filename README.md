@@ -189,6 +189,7 @@ new Claude({
 | `speed` | `"fast"` | 高速モード |
 | `ctx1m` | `boolean` | 1Mコンテキスト |
 | `redact` | `boolean` | thinking暗号化ベータを送る（interactive時のデフォルト: `true`） |
+| `lowPriority` | `boolean \| "v2s" \| "v2d" \| "v2p"` | 低優先度モード：`anthropic-dispatch-id` ヘッダを付ける |
 | `cache` | `boolean` | プロンプトキャッシュ（デフォルト: `true`） |
 | `signal` | `AbortSignal` | キャンセル |
 | `timeout` | `number` | タイムアウト（ms） |

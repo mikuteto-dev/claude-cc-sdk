@@ -25,7 +25,7 @@ export interface Send {
   system?: string | Anthropic.Messages.TextBlockParam[];
   messages: Msg[];
   maxTokens?: number;
-  thinking?: boolean | "adaptive" | { type: "enabled"; budget_tokens: number };
+  thinking?: boolean | "adaptive" | { type: "enabled"; budget_tokens: number } | { type: "disabled" };
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   tools?: Tool[];
   toolChoice?: Anthropic.Messages.ToolChoice;
@@ -35,21 +35,24 @@ export interface Send {
   ctx1m?: boolean;
   redact?: boolean;
   cache?: boolean;
+  lowPriority?: boolean | "v2s" | "v2d" | "v2p";
   betas?: string[];
   signal?: AbortSignal;
   timeout?: number;
 }
 
 // Keep these values aligned with the installed Claude Code binary.
-const VER = "2.1.278";
+const VER = "2.1.283";
 const B = {
   cc: "claude-code-20250219",     oauth: "oauth-2025-04-20",
+  ctx1m: "context-1m-2025-08-07",
   isp: "interleaved-thinking-2025-05-14", redact: "redact-thinking-2026-02-12",
   ttc: "thinking-token-count-2026-05-13", ctx: "context-management-2025-06-27",
   cache: "prompt-caching-scope-2026-01-05", midSys: "mid-conversation-system-2026-04-07",
-  advisor: "advisor-tool-2026-03-01", effort: "effort-2025-11-24",
+  perTurn: "per-turn-control-2026-07-01", midTool: "mid-conversation-tool-changes-2026-07-01",
+  effort: "effort-2025-11-24",
   extTtl: "extended-cache-ttl-2025-04-11",
-  fast: "fast-mode-2026-02-01",   ctx1m: "context-1m-2025-08-07",
+  fast: "fast-mode-2026-02-01",
 } as const;
 
 // Model capability gates, mirroring CC's bundled catalog. Unknown names fall
@@ -57,9 +60,12 @@ const B = {
 const NON_ADAPTIVE = ["claude-3-", "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5",
   "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-haiku-4-5"];
 const MIDCONV = ["claude-sonnet-5", "claude-opus-4-8", "claude-opus-5", "claude-fable-5",
-  "claude-mythos-5-1"];
+  "claude-mythos-5"];
+const MIDTOOL = ["claude-opus-4-8", "claude-opus-5", "claude-fable-5", "claude-mythos-5"];
+const PERTURN = ["claude-opus-5-5", "claude-fable-5-1"];
 const EFFORT = ["claude-sonnet-4-6", "claude-sonnet-5", "claude-opus-4-6", "claude-opus-4-7",
-  "claude-opus-4-8", "claude-opus-5", "claude-fable-5", "claude-mythos-5-1"];
+  "claude-opus-4-8", "claude-opus-5", "claude-fable-5", "claude-mythos-5"];
+const OUT128K = ["claude-opus-5-5"];
 const OUT64K = ["claude-sonnet-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
   "claude-opus-5", "claude-fable-5", "claude-mythos-5"];
 const OUT32K = ["claude-haiku-4-5", "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6",
@@ -70,9 +76,16 @@ const adaptiveCapable = (m: string) => !has(m, NON_ADAPTIVE);
 const thinkCapable = (m: string) => !m.includes("claude-3-");
 const midConv = (m: string) => has(m, MIDCONV);
 const effortCapable = (m: string) => has(m, EFFORT);
-const effortDefault = (m: string) => m.includes("claude-opus-4-7") ? "xhigh" : "high";
+const EFFORT_XHIGH = ["claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5", "claude-opus-4-6",
+  "claude-opus-4-7"];
+function effortDefault(m: string) {
+  if (has(m, EFFORT_XHIGH)) return "xhigh";
+  if (m.includes("claude-opus-5-5")) return "medium";
+  return "high";
+}
 
 function maxOut(m: string): number {
+  if (has(m, OUT128K)) return 128000;
   if (has(m, OUT64K)) return 64000;
   if (has(m, OUT32K)) return 32000;
   if (m.includes("claude-3-opus") || m.includes("claude-3-haiku")) return 4096;
@@ -228,6 +241,7 @@ export class Claude {
   private betas(o: Send, model: string) {
     const b: string[] = [B.cc];
     if (this.auth.oauth) b.push(B.oauth);
+    if (o.ctx1m) b.push(B.ctx1m);
     if (thinkCapable(model)) {
       b.push(B.isp);
       if (o.redact ?? this.interactive) b.push(B.redact);
@@ -235,17 +249,23 @@ export class Claude {
     }
     b.push(B.cache);
     if (midConv(model)) b.push(B.midSys);
-    b.push(B.advisor);
+    if (has(model, PERTURN)) b.push(B.perTurn);
+    if (has(model, MIDTOOL)) b.push(B.midTool);
     if (effortCapable(model)) b.push(B.effort);
     if (this.ttl() === "1h") b.push(B.extTtl);
-    if (o.ctx1m) b.push(B.ctx1m);
     if (o.speed === "fast") b.push(B.fast);
     for (const x of [...this.xbetas, ...(o.betas ?? [])]) if (!b.includes(x)) b.push(x);
     return b;
   }
 
   private params(o: Send, stream = false) {
-    const model = o.model ?? this.model;
+    let model = o.model ?? this.model;
+    // CC's `[1m]` model suffix selects the 1M route: it goes on the wire as the
+    // bare id plus the context-1m beta, never as part of `model`.
+    if (model.endsWith("[1m]")) {
+      model = model.slice(0, -4);
+      o = { ...o, ctx1m: true };
+    }
     const maxTokens = o.maxTokens ?? maxOut(model);
     const { on: think, param: thinkParam } = resolveThinking(o.thinking, this.interactive, model, maxTokens);
     const useCache = o.cache !== false;
@@ -278,7 +298,7 @@ export class Claude {
       // CC only sends temperature when explicitly set, and never with thinking
       ...(!think && o.temperature !== undefined && { temperature: o.temperature }),
       ...(think && { thinking: thinkParam }),
-      ...(think && { context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] } }),
+      ...(think && { context_management: { edits: thinkParam?.type === "disabled" ? [] : [{ type: "clear_thinking_20251015", keep: "all" }] } }),
       ...(Object.keys(oc).length && { output_config: oc }),
       ...(o.speed && { speed: o.speed }),
       ...extra,
@@ -350,9 +370,21 @@ export class Claude {
     return typeof o === "string" ? { messages: [{ role: "user", content: o }] } : o;
   }
 
+  // CC's lower-priority mode (`/low-priority`) marks requests with the
+  // anthropic-dispatch-id header: "v2d" when the v2d gate is on, else "v2s".
+  // CC's retry fallback lane "v2p" is reachable by passing the string directly.
+  private lane(o: Send): string | undefined {
+    const v = o.lowPriority;
+    if (!v) return undefined;
+    if (v !== true) return v;
+    return process.env.CLAUDE_CODE_DISPATCH_V2D !== undefined ? "v2d" : "v2s";
+  }
+
   private reqOpts(o: Send, stream: boolean) {
+    const lane = this.lane(o);
     return {
       ...(o.signal && { signal: o.signal }),
+      ...(lane && { headers: { "anthropic-dispatch-id": lane } }),
       timeout: o.timeout ?? (stream ? 600_000 : 300_000),
     };
   }
